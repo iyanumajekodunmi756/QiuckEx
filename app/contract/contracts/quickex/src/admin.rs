@@ -8,6 +8,10 @@ use crate::storage;
 use crate::types::{FeeConfig, PerAssetFeeConfig, Role};
 use soroban_sdk::{Address, Env, Vec};
 
+/// Maximum allowed fee basis points (10% = 1000 bps).
+/// This is a safety limit to prevent misconfiguration.
+const MAX_FEE_BPS: u32 = 1000;
+
 /// Initialize the contract with an admin address.
 ///
 /// This is a one-time operation; subsequent calls fail with [`AlreadyInitialized`].
@@ -217,8 +221,14 @@ pub fn set_pause_flags(
 pub fn set_fee_config(env: &Env, caller: &Address, config: FeeConfig) -> Result<(), QuickexError> {
     require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
 
+    // Enforce maximum fee constraint
+    if config.fee_bps > MAX_FEE_BPS {
+        return Err(QuickexError::InvalidAmount);
+    }
+
+    let old_config = storage::get_fee_config(env);
     storage::set_fee_config(env, &config);
-    crate::events::publish_fee_config_changed(env, config.fee_bps);
+    crate::events::publish_fee_config_changed(env, old_config.fee_bps, config.fee_bps);
     Ok(())
 }
 
@@ -231,12 +241,16 @@ pub fn set_per_asset_fee(
 ) -> Result<(), QuickexError> {
     require_any_role(env, caller, &[Role::Admin, Role::Operator])?;
 
-    if config.fee_bps > 10_000 || config.arbiter_bps > 10_000 {
+    // Enforce maximum fee constraints
+    if config.fee_bps > MAX_FEE_BPS || config.arbiter_bps > 10_000 {
         return Err(QuickexError::InvalidAmount);
     }
 
+    let old_config = storage::get_per_asset_fee(env, &token);
     storage::set_per_asset_fee(env, &token, &config);
-    publish_per_asset_fee_set(env, token, config.fee_bps, config.arbiter_bps);
+    let old_fee_bps = old_config.map(|c| c.fee_bps).unwrap_or(0);
+    let old_arbiter_bps = old_config.map(|c| c.arbiter_bps).unwrap_or(0);
+    publish_per_asset_fee_set(env, token, old_fee_bps, old_arbiter_bps, config.fee_bps, config.arbiter_bps);
     Ok(())
 }
 
@@ -267,12 +281,12 @@ pub fn set_platform_wallet(
 /// Rotate active fee collector (**Admin only**).
 pub fn rotate_fee_collector(
     env: &Env,
-    caller: &Address,
+    caller: Address,
     new_collector: Address,
-) -> Result<u32, QuickexError> {
-    require_admin(env, caller)?;
+) -> Result<(), QuickexError> {
+    require_admin(env, &caller)?;
 
-    let next_index = fee_router::rotate_collector(env, &new_collector);
-    publish_fee_collector_rotated(env, new_collector, next_index);
-    Ok(next_index)
+    let new_index = fee_router::rotate_collector(env, &new_collector);
+    publish_fee_collector_rotated(env, caller, new_collector, new_index);
+    Ok(())
 }

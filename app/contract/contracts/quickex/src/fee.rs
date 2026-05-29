@@ -1,4 +1,4 @@
-//! 플랫폼 fee calculation logic.
+//! Platform fee calculation logic with deterministic rounding.
 
 use crate::{oracle, storage};
 use soroban_sdk::{Address, Env};
@@ -7,6 +7,12 @@ use soroban_sdk::{Address, Env};
 ///
 /// Uses dynamic oracle pricing when configured and falls back to the static
 /// fee basis points if the oracle is unavailable or stale.
+/// 
+/// ## Rounding
+/// All fee calculations use floor division for deterministic results:
+/// - `fee = floor((amount * bps) / 10000)`
+/// This ensures predictable behavior across all amounts and prevents rounding
+/// inconsistencies that could lead to audit discrepancies.
 pub fn calculate_fee(env: &Env, amount: i128) -> i128 {
     if amount <= 0 {
         return 0;
@@ -37,6 +43,7 @@ pub fn calculate_fee(env: &Env, amount: i128) -> i128 {
     }
 
     let bps = config.fee_bps as i128;
+    // Use deterministic floor division
     (amount * bps) / 10000
 }
 
@@ -46,6 +53,9 @@ pub fn calculate_fee(env: &Env, amount: i128) -> i128 {
 /// 1. Per-asset fee config for `token` (if set).
 /// 2. Oracle dynamic pricing (if configured and fresh).
 /// 3. Global static `FeeConfig` basis points.
+///
+/// ## Rounding
+/// Uses floor division for deterministic results: `fee = floor((amount * bps) / 10000)`
 pub fn calculate_fee_for_token(env: &Env, token: &Address, amount: i128) -> i128 {
     if amount <= 0 {
         return 0;
@@ -55,6 +65,7 @@ pub fn calculate_fee_for_token(env: &Env, token: &Address, amount: i128) -> i128
         if per_asset.fee_bps == 0 {
             return 0;
         }
+        // Use deterministic floor division
         return (amount * per_asset.fee_bps as i128) / 10000;
     }
     // Fall back to oracle + global bps path.

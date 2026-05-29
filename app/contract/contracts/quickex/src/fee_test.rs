@@ -1,4 +1,4 @@
-use crate::{types::FeeConfig, QuickexContract, QuickexContractClient};
+use crate::{types::{FeeConfig, PerAssetFeeConfig}, QuickexContract, QuickexContractClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Bytes, Env,
@@ -138,4 +138,157 @@ fn test_zero_fee() {
 
     assert_eq!(token_client.balance(&owner), 10000);
     assert_eq!(token_client.balance(&platform_wallet), 0);
+}
+
+#[test]
+fn test_fee_config_max_constraint() {
+    let env = Env::default();
+    let (client, admin, platform_wallet, _, _) = setup_test(&env);
+
+    env.mock_all_auths();
+
+    // Test that fee config exceeding MAX_FEE_BPS (1000 = 10%) fails
+    let excessive_fee = FeeConfig { fee_bps: 1001 }; // Exceeds 10%
+    let result = client.try_set_fee_config(&admin, &excessive_fee);
+    assert!(result.is_err()); // Should fail with InvalidAmount error
+
+    // Test that fee config at exactly MAX_FEE_BPS succeeds
+    let max_fee = FeeConfig { fee_bps: 1000 }; // Exactly 10%
+    client.set_fee_config(&admin, &max_fee);
+    assert_eq!(client.get_fee_config().fee_bps, 1000);
+
+    // Test that reasonable fee config succeeds
+    let normal_fee = FeeConfig { fee_bps: 250 }; // 2.5%
+    client.set_fee_config(&admin, &normal_fee);
+    assert_eq!(client.get_fee_config().fee_bps, 250);
+}
+
+#[test]
+fn test_per_asset_fee_max_constraint() {
+    let env = Env::default();
+    let (client, admin, _, _, _) = setup_test(&env);
+
+    env.mock_all_auths();
+
+    let token = Address::generate(&env);
+
+    // Test that per-asset fee config exceeding MAX_FEE_BPS fails
+    let excessive_per_asset = PerAssetFeeConfig { 
+        fee_bps: 1001, // Exceeds 10%
+        arbiter_bps: 0 
+    };
+    let result = client.try_set_per_asset_fee(&admin, &token, &excessive_per_asset);
+    assert!(result.is_err()); // Should fail with InvalidAmount error
+
+    // Test that per-asset fee config at exactly MAX_FEE_BPS succeeds
+    let max_per_asset = PerAssetFeeConfig { 
+        fee_bps: 1000, // Exactly 10%
+        arbiter_bps: 0 
+    };
+    client.set_per_asset_fee(&admin, &token, &max_per_asset);
+    
+    let retrieved = client.get_per_asset_fee(&token);
+    assert!(retrieved.is_some());
+    assert_eq!(retrieved.unwrap().fee_bps, 1000);
+}
+
+#[test]
+fn test_extreme_fee_values() {
+    let env = Env::default();
+    let (client, admin, platform_wallet, owner, recipient) = setup_test(&env);
+
+    // Setup token
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::Client::new(&env, &token_id);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+    env.mock_all_auths();
+
+    // Test with maximum allowed fee (10%)
+    client.set_fee_config(&admin, &FeeConfig { fee_bps: 1000 });
+    client.set_platform_wallet(&admin, &platform_wallet);
+
+    token_admin_client.mint(&owner, &10000);
+
+    let amount = 1000i128;
+    let salt = Bytes::from_array(&env, &[1; 32]);
+    let commitment = client.deposit(&token_id, &amount, &owner, &salt, &3600, &None);
+
+    client.withdraw(&token_id, &amount, &commitment, &owner, &salt);
+
+    // Fee should be exactly 10%: 1000 * 1000 / 10000 = 100
+    assert_eq!(token_client.balance(&owner), 9900);
+    assert_eq!(token_client.balance(&platform_wallet), 100);
+    assert_eq!(token_client.balance(&client.address), 0);
+}
+
+#[test]
+fn test_small_amount_fee_calculation() {
+    let env = Env::default();
+    let (client, admin, platform_wallet, owner, _) = setup_test(&env);
+
+    // Setup token
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::Client::new(&env, &token_id);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+    env.mock_all_auths();
+
+    // Test with very small amounts to ensure floor division works correctly
+    client.set_fee_config(&admin, &FeeConfig { fee_bps: 100 }); // 1%
+    client.set_platform_wallet(&admin, &platform_wallet);
+
+    // Test with amount = 1 (smallest possible positive amount)
+    token_admin_client.mint(&owner, &100);
+
+    let amount = 1i128;
+    let salt = Bytes::from_array(&env, &[1; 32]);
+    let commitment = client.deposit(&token_id, &amount, &owner, &salt, &3600, &None);
+
+    client.withdraw(&token_id, &amount, &commitment, &owner, &salt);
+
+    // Fee should be floor(1 * 100 / 10000) = floor(0.01) = 0
+    assert_eq!(token_client.balance(&owner), 100);
+    assert_eq!(token_client.balance(&platform_wallet), 0);
+}
+
+#[test]
+fn test_rounding_determinism() {
+    let env = Env::default();
+    let (client, admin, platform_wallet, owner, _) = setup_test(&env);
+
+    // Setup token
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::Client::new(&env, &token_id);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+    env.mock_all_auths();
+
+    // Test with a fee that produces fractional results
+    client.set_fee_config(&admin, &FeeConfig { fee_bps: 333 }); // 3.33%
+    client.set_platform_wallet(&admin, &platform_wallet);
+
+    token_admin_client.mint(&owner, &10000);
+
+    // Test amount that would produce fractional fee: 1000 * 333 / 10000 = 33.3
+    // With floor division, this should be 33
+    let amount = 1000i128;
+    let salt = Bytes::from_array(&env, &[1; 32]);
+    let commitment = client.deposit(&token_id, &amount, &owner, &salt, &3600, &None);
+
+    client.withdraw(&token_id, &amount, &commitment, &owner, &salt);
+
+    // Fee should be floor(33.3) = 33, net payout = 967
+    assert_eq!(token_client.balance(&owner), 967);
+    assert_eq!(token_client.balance(&platform_wallet), 33);
+    assert_eq!(token_client.balance(&client.address), 0);
 }
